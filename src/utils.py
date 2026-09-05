@@ -197,7 +197,10 @@ def ttml_convent(ttml: str) -> str:
                 continue
             lyric_time: str = lyric.get("begin")
             if not lyric_time:
-                return ""
+                # Pure-text lyrics have no timing.  Preserve the plain text
+                # as a non-timestamped LRC line.
+                lrc_lines.append(lyric.text or "")
+                continue
             ts = _ttml_time_to_lrc(lyric_time)
             lrc_lines.append(f"[{ts}]{lyric.text}")
             for extra in _lyrics_extra_lines(b, lyric.get("itunes:key"), ts):
