@@ -193,11 +193,13 @@ class Ripper:
                                                                it(Config).download.coverFormat,
                                                                it(Config).download.coverSize))
             lyrics_f = None
-            if raw_metadata.attributes.hasTimeSyncedLyrics:
-                # Upstream wrapper-lite /lyrics:
+            if raw_metadata.attributes.hasLyrics or raw_metadata.attributes.hasTimeSyncedLyrics:
+                # Fetch lyrics for both synced (word/line-timed) and plain-text
+                # tracks.  Upstream wrapper-lite /lyrics:
                 #   syllable=1 -> word-timed TTML (karaoke)
                 #   syllable=0 -> line-timed TTML, still including
-                #                 translations/transliterations
+                #                 translations/transliterations, or plain text
+                #                 when the track has no timing.
                 # So request exactly what the user's lyricsSyllable asks for.
                 cfg_dl = it(Config).download
                 lyrics_f = asyncio.create_task(it(WrapperClient).lyrics(
