@@ -520,6 +520,39 @@ def _patch_moov(moov: bytes, stts: bytes, stsc: bytes, stsz: bytes,
     return bytes(out)
 
 
+def _patch_elst_duration(edts: bytes, media_duration: int) -> bytes:
+    """Set the elst entry segment duration to the full track duration.
+
+    Apple's EC3/Atmos fMP4 init carries an edit list whose segment duration
+    is 0 (only media_time=3072 priming is meaningful).  After converting to a
+    progressive MP4, players/ffmpeg interpret that 0-duration edit as a zero
+    length file.  Rewrite every elst entry's segment duration to the track's
+    media duration while keeping media_time (priming offset) intact.
+    """
+    out = bytearray(edts)
+    # edts contains elst as a child; locate and patch all elst boxes.
+    idx = out.find(b"elst")
+    while idx != -1 and idx >= 4:
+        size = struct.unpack(">I", out[idx - 4:idx])[0]
+        if size >= 16 and idx - 4 + size <= len(out):
+            payload = idx + 4  # after size(4)+type(4)
+            vaf = struct.unpack(">I", out[payload:payload + 4])[0]
+            version = vaf >> 24
+            count = struct.unpack(">I", out[payload + 4:payload + 8])[0]
+            p = payload + 8
+            for _ in range(count):
+                if version == 1:
+                    # segment_duration u64, media_time i64, media_rate i16/i16
+                    struct.pack_into(">Q", out, p, media_duration)
+                    p += 16 + 4
+                else:
+                    # segment_duration u32, media_time i32, media_rate i16/i16
+                    struct.pack_into(">I", out, p, media_duration)
+                    p += 8 + 4
+        idx = out.find(b"elst", idx + 4)
+    return bytes(out)
+
+
 def _patch_trak(trak: bytes, stts: bytes, stsc: bytes, stsz: bytes,
                 stco_placeholder: bytes | None, media_duration: int) -> bytes:
     out = bytearray()
@@ -544,6 +577,10 @@ def _patch_trak(trak: bytes, stts: bytes, stsc: bytes, stsz: bytes,
         if b == b"mdia":
             out += _patch_mdia(mdia := trak[ps - hs:pe], stts, stsc, stsz,
                                stco_placeholder, media_duration)
+            continue
+
+        if b == b"edts":
+            out += _patch_elst_duration(trak[ps - hs:pe], media_duration)
             continue
 
         out += trak[ps - hs:pe]
