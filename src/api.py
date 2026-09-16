@@ -56,9 +56,13 @@ class WebAPI:
 
     def __init__(self, proxy: str, parallel_num: int):
         self._set_token()
+        api_timeout = httpx.Timeout(connect=15.0, read=30.0, write=15.0, pool=60.0)
+        api_limits = httpx.Limits(max_connections=128, max_keepalive_connections=32, keepalive_expiry=60.0)
         self.client = AsyncClient(headers={"Authorization": f"Bearer {self.token}",
                                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
                                            "Origin": "https://music.apple.com"},
+                                  timeout=api_timeout,
+                                  limits=api_limits,
                                   proxy=proxy if proxy else None)
         # Shared streaming client for CDN downloads.  Lazily created on the
         # first stream_song call (needs a running loop for the transport);
@@ -69,7 +73,9 @@ class WebAPI:
         self.download_client = None
         self.download_proxy = proxy if proxy else None
         self.download_lock = asyncio.Semaphore(parallel_num)
-        self.request_lock = asyncio.Semaphore(256)
+        # Gate concurrent API queries so they queue cleanly at the semaphore
+        # rather than overflowing httpx's internal connection pool queue.
+        self.request_lock = asyncio.Semaphore(64)
 
     def _get_download_client(self) -> httpx.AsyncClient:
         """Return the shared CDN download client, creating it on first use."""

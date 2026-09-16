@@ -617,36 +617,47 @@ class Ripper:
     # Containers (album / artist / playlist)
     # ------------------------------------------------------------------ #
     async def rip_album(self, url: Album, codec: str, flags: Flags = Flags(), parent_done: ParentDoneHandler = None):
-        album_info = await self._get_album_info_cached(url.id, url.storefront, flags.language)
-        logger = RipLogger(url.type, url.id)
-        album_name  = album_info.data[0].attributes.name
-        artist_name = album_info.data[0].attributes.artistName
-        logger.set_fullname(artist_name, album_name)
-        logger.create()
-        if not await check_album_existence(url.id, url.storefront):
-            logger.not_exist()
-            return
-        # Register album group node in the TUI task tree.
         try:
-            from creart import it as _it
-            from src.tui.task_tree import TaskTree, NodeKind
-            _it(TaskTree).register_group(url.id, NodeKind.ALBUM,
-                                         f"{artist_name} - {album_name}")
-        except Exception:
-            pass
+            album_info = await self._get_album_info_cached(url.id, url.storefront, flags.language)
+            logger = RipLogger(url.type, url.id)
+            album_name  = album_info.data[0].attributes.name
+            artist_name = album_info.data[0].attributes.artistName
+            logger.set_fullname(artist_name, album_name)
+            logger.create()
+            if not await check_album_existence(url.id, url.storefront):
+                logger.not_exist()
+                if parent_done:
+                    await parent_done.try_done()
+                return
+            # Register album group node in the TUI task tree.
+            try:
+                from creart import it as _it
+                from src.tui.task_tree import TaskTree, NodeKind
+                _it(TaskTree).register_group(url.id, NodeKind.ALBUM,
+                                             f"{artist_name} - {album_name}")
+            except Exception:
+                pass
 
-        async def on_children_done():
-            logger.done()
+            async def on_children_done():
+                logger.done()
+                if parent_done:
+                    await parent_done.try_done()
+
+            tracks = album_info.data[0].relationships.tracks.data if album_info.data and album_info.data[0].relationships.tracks else []
+            if not tracks:
+                await on_children_done()
+                return
+
+            done_handler = ParentDoneHandler(len(tracks), on_children_done)
+            safely_create_task(self._prefetch_batch([t.id for t in tracks], url.storefront, codec, flags.language))
+            for track in tracks:
+                song = Song(id=track.id, storefront=url.storefront, url="", type=URLType.Song)
+                safely_create_task(self.rip_song(song, codec, flags, done_handler,
+                                                 group_node_id=url.id))
+        except Exception:
             if parent_done:
                 await parent_done.try_done()
-
-        done_handler = ParentDoneHandler(len(album_info.data[0].relationships.tracks.data), on_children_done)
-        tracks = album_info.data[0].relationships.tracks.data
-        safely_create_task(self._prefetch_batch([t.id for t in tracks], url.storefront, codec, flags.language))
-        for track in tracks:
-            song = Song(id=track.id, storefront=url.storefront, url="", type=URLType.Song)
-            safely_create_task(self.rip_song(song, codec, flags, done_handler,
-                                             group_node_id=url.id))
+            raise
 
     async def rip_artist(self, url: Album, codec: str, flags: Flags = Flags()):
         artist_info = await it(WebAPI).get_artist_info(url.id, url.storefront, flags.language)
@@ -668,14 +679,42 @@ class Ripper:
         if flags.include_participate_in_works:
             songs = await it(WebAPI).get_songs_from_artist(url.id, url.storefront, flags.language)
             done_handler = ParentDoneHandler(len(songs), on_children_done)
+            # Bound song dispatch to prevent spawning thousands of coroutines at once
+            max_tasks = it(Config).download.maxRunningTasks
+            song_sem = asyncio.Semaphore(max_tasks * 2 if max_tasks else 64)
+
+            async def _bounded_rip_song(s_url):
+                async with song_sem:
+                    await self.rip_song(Song.parse_url(s_url), codec, flags,
+                                        done_handler, group_node_id=url.id)
+
             for song_url in songs:
-                safely_create_task(self.rip_song(Song.parse_url(song_url), codec, flags,
-                                                 done_handler, group_node_id=url.id))
+                safely_create_task(_bounded_rip_song(song_url))
         else:
             albums = await it(WebAPI).get_albums_from_artist(url.id, url.storefront, flags.language)
             done_handler = ParentDoneHandler(len(albums), on_children_done)
+            # Bound active album concurrency (2 albums at a time).
+            # This prevents queueing thousands of tracks and overwhelming wrapper/m3u8,
+            # while keeping download workers 100% utilized.
+            album_sem = asyncio.Semaphore(2)
+
+            async def _bounded_rip_album(a_url):
+                async with album_sem:
+                    album_finished = asyncio.Event()
+
+                    async def _on_album_completed():
+                        album_finished.set()
+
+                    album_done_handler = ParentDoneHandler(1, _on_album_completed)
+                    try:
+                        await self.rip_album(Album.parse_url(a_url), codec, flags, parent_done=album_done_handler)
+                        await album_finished.wait()
+                    finally:
+                        if done_handler:
+                            await done_handler.try_done()
+
             for album_url in albums:
-                safely_create_task(self.rip_album(Album.parse_url(album_url), codec, flags, done_handler))
+                safely_create_task(_bounded_rip_album(album_url))
 
     async def rip_playlist(self, url: Playlist, codec: str, flags: Flags = Flags()):
         playlist_info = await it(WebAPI).get_playlist_info_and_tracks(url.id, url.storefront, flags.language)

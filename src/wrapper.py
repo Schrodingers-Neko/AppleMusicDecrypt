@@ -100,9 +100,12 @@ class WrapperClient:
 
     def __init__(self, url: str, secure: bool):
         self._base_url = f"{'https' if secure else 'http'}://{url}"
+        wrapper_timeout = httpx.Timeout(10.0, connect=10.0, read=30.0, write=10.0, pool=60.0)
+        wrapper_limits = httpx.Limits(max_connections=64, max_keepalive_connections=16, keepalive_expiry=60.0)
         self._client = httpx.AsyncClient(
             base_url=self._base_url,
-            timeout=(10, 30),
+            timeout=wrapper_timeout,
+            limits=wrapper_limits,
             http2=False,
         )
         self._semaphore = asyncio.Semaphore(64)
