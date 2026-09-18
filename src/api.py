@@ -73,9 +73,9 @@ class WebAPI:
         self.download_client = None
         self.download_proxy = proxy if proxy else None
         self.download_lock = asyncio.Semaphore(parallel_num)
-        # Gate concurrent API queries so they queue cleanly at the semaphore
-        # rather than overflowing httpx's internal connection pool queue.
         self.request_lock = asyncio.Semaphore(64)
+        self._cover_cache: dict[str, bytes] = {}
+        self._cover_pending: dict[str, asyncio.Future] = {}
 
     def _get_download_client(self) -> httpx.AsyncClient:
         """Return the shared CDN download client, creating it on first use."""
@@ -204,11 +204,27 @@ class WebAPI:
             tracks.extend(next_tracks)
         return tracks
 
-    async def get_cover(self, url: str, cover_format: str, cover_size: str):
-        async with self.request_lock:
-            formatted_url = regex.sub('bb.jpg', f'bb.{cover_format}', url)
-            req = await self._request("GET", formatted_url.replace("{w}x{h}", cover_size))
-            return req.content
+    async def get_cover(self, url: str, cover_format: str, cover_size: str) -> bytes:
+        formatted_url = regex.sub('bb.jpg', f'bb.{cover_format}', url)
+        target_url = formatted_url.replace("{w}x{h}", cover_size)
+        if target_url in self._cover_cache:
+            return self._cover_cache[target_url]
+        pending = self._cover_pending.get(target_url)
+        if pending is not None:
+            return await pending
+        fut = asyncio.get_running_loop().create_future()
+        self._cover_pending[target_url] = fut
+        try:
+            req = await self._request("GET", target_url)
+            content = req.content
+            self._cover_cache[target_url] = content
+            fut.set_result(content)
+            return content
+        except Exception as e:
+            fut.set_exception(e)
+            raise
+        finally:
+            self._cover_pending.pop(target_url, None)
 
     async def get_song_info(self, song_id: str, storefront: str, lang: str):
         req = await self._request("GET", f"https://amp-api.music.apple.com/v1/catalog/{storefront}/songs/{song_id}",

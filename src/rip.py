@@ -69,7 +69,8 @@ class Ripper:
     def __init__(self):
         self.download_manager = DownloadManager()
         # Batch pre-fetch caches (shared across an album/playlist's songs).
-        self._m3u8_cache: dict[str, str] = {}          # adam_id -> wrapper m3u8 URL
+        self._m3u8_cache: dict[str, Optional[str]] = {}  # adam_id -> wrapper m3u8 URL or None if failed
+        self._m3u8_pending: dict[str, asyncio.Future] = {}  # adam_id -> in-flight Future
         self._song_info_cache: dict[tuple, object] = {}
         self._song_info_pending: dict[tuple, asyncio.Future] = {}
         self._album_info_cache: dict[tuple, object] = {}
@@ -78,6 +79,34 @@ class Ripper:
     # ------------------------------------------------------------------ #
     # Cached metadata fetches (dedupe across songs, in-flight coalescing)
     # ------------------------------------------------------------------ #
+    async def _get_m3u8_cached(self, adam_id: str) -> Optional[str]:
+        """Fetch and cache wrapper /m3u8 with in-flight request coalescing.
+
+        If a fetch is already in flight for ``adam_id``, subsequent callers await
+        the same future rather than sending duplicate requests to the wrapper.
+        If the wrapper fails or times out, ``None`` is cached so subsequent callers
+        fall back immediately to web API enhancedHls without re-hammering the wrapper.
+        """
+        if adam_id in self._m3u8_cache:
+            return self._m3u8_cache[adam_id]
+        pending = self._m3u8_pending.get(adam_id)
+        if pending is not None:
+            return await pending
+        fut = asyncio.get_running_loop().create_future()
+        self._m3u8_pending[adam_id] = fut
+        try:
+            url = await it(WrapperClient).m3u8(adam_id)
+            self._m3u8_cache[adam_id] = url
+            fut.set_result(url)
+            return url
+        except Exception:
+            # Cache failure as None so concurrent and subsequent callers fail fast to enhancedHls
+            self._m3u8_cache[adam_id] = None
+            fut.set_result(None)
+            return None
+        finally:
+            self._m3u8_pending.pop(adam_id, None)
+
     async def _get_song_info_cached(self, adam_id: str, storefront: str, lang: str):
         key = (adam_id, storefront, lang)
         if key in self._song_info_cache:
@@ -128,6 +157,7 @@ class Ripper:
         if not adam_ids:
             return
         sem = asyncio.Semaphore(16)
+        m3u8_sem = asyncio.Semaphore(2)
 
         async def warm_template():
             try:
@@ -145,16 +175,19 @@ class Ripper:
         async def warm_m3u8(a):
             if codec != Codec.ALAC or a in self._m3u8_cache:
                 return
-            async with sem:
+            async with m3u8_sem:
                 try:
-                    self._m3u8_cache[a] = await it(WrapperClient).m3u8(a)
+                    await self._get_m3u8_cached(a)
                 except Exception:
                     pass
 
+        # Only warm m3u8 for the first batch of tracks to let downloads start immediately
+        # without queuing dozens of wrapper requests ahead of active workers.
+        lead_m3u8_ids = adam_ids[:max(4, it(Config).download.parallelNum * 2)]
         await asyncio.gather(
             warm_template(),
             *[warm_song(a) for a in adam_ids],
-            *[warm_m3u8(a) for a in adam_ids],
+            *[warm_m3u8(a) for a in lead_m3u8_ids],
         )
 
     # ------------------------------------------------------------------ #
@@ -184,29 +217,12 @@ class Ripper:
         try:
             await self.download_manager.register_task(task)
 
-            # Fetch metadata (song info, then album + cover + lyrics in parallel)
+            # Fetch metadata (song info and album info)
             task.update_status(Status.PARSING)
             raw_metadata = await self._get_song_info_cached(task.adamId, url.storefront, flags.language)
             album_id = raw_metadata.relationships.albums.data[0].id
-            album_f = asyncio.create_task(self._get_album_info_cached(album_id, url.storefront, flags.language))
-            cover_f = asyncio.create_task(it(WebAPI).get_cover(raw_metadata.attributes.artwork.url,
-                                                               it(Config).download.coverFormat,
-                                                               it(Config).download.coverSize))
-            lyrics_f = None
-            if raw_metadata.attributes.hasLyrics or raw_metadata.attributes.hasTimeSyncedLyrics:
-                # Fetch lyrics for both synced (word/line-timed) and plain-text
-                # tracks.  Upstream wrapper-lite /lyrics:
-                #   syllable=1 -> word-timed TTML (karaoke)
-                #   syllable=0 -> line-timed TTML, still including
-                #                 translations/transliterations, or plain text
-                #                 when the track has no timing.
-                # So request exactly what the user's lyricsSyllable asks for.
-                cfg_dl = it(Config).download
-                lyrics_f = asyncio.create_task(it(WrapperClient).lyrics(
-                    task.adamId, flags.language, url.storefront,
-                    syllable=cfg_dl.lyricsSyllable))
+            album_data = await self._get_album_info_cached(album_id, url.storefront, flags.language)
 
-            album_data = await album_f
             task.metadata = SongMetadata.parse_from_song_data(raw_metadata)
             task.metadata.parse_from_album_data(album_data)
 
@@ -223,23 +239,37 @@ class Ripper:
                 task.error = Exception("Song not found on Apple Music")
                 return
 
-            task.metadata.cover = await cover_f
-            if lyrics_f is not None:
-                task.metadata.lyrics = await lyrics_f
-
             if playlist:
                 task.metadata.set_playlist_index(playlist.songIdIndexMapping.get(url.id))
 
+            # Fast disk check: skip cover, lyrics, and m3u8 fetching if song already exists!
             if not flags.force_save and check_song_exists(task.metadata, codec, playlist):
                 task.logger.already_exist()
                 task.update_status(Status.ALREADY_EXIST)
                 return
+
+            # Song needs to be downloaded: fetch cover and lyrics in parallel with m3u8/extract_media
+            cover_f = asyncio.create_task(it(WebAPI).get_cover(raw_metadata.attributes.artwork.url,
+                                                               it(Config).download.coverFormat,
+                                                               it(Config).download.coverSize))
+            lyrics_f = None
+            if raw_metadata.attributes.hasLyrics or raw_metadata.attributes.hasTimeSyncedLyrics:
+                cfg_dl = it(Config).download
+                lyrics_f = asyncio.create_task(it(WrapperClient).lyrics(
+                    task.adamId, flags.language, url.storefront,
+                    syllable=cfg_dl.lyricsSyllable))
 
             m3u8_url = await self._get_m3u8_url(task, codec, raw_metadata)
 
             if codec == Codec.AAC_LEGACY or (
                     it(Config).download.codecAlternative and not raw_metadata.attributes.extendedAssetUrls.enhancedHls
                     and Codec.AAC_LEGACY in it(Config).download.codecPriority):
+                task.metadata.cover = await cover_f
+                if lyrics_f is not None:
+                    try:
+                        task.metadata.lyrics = await lyrics_f
+                    except Exception:
+                        task.logger.lyrics_not_exist()
                 await self._rip_song_legacy(task, timeout_sec)
                 return
 
@@ -264,6 +294,13 @@ class Ripper:
                     task.logger.already_exist()
                     task.update_status(Status.ALREADY_EXIST)
                     return
+
+            task.metadata.cover = await cover_f
+            if lyrics_f is not None:
+                try:
+                    task.metadata.lyrics = await lyrics_f
+                except Exception:
+                    task.logger.lyrics_not_exist()
 
             if it(Config).download.streamDecrypt or it(Config).download.lowMemory:
                 # streaming is disk-backed (.part) and low-memory friendly
@@ -303,14 +340,10 @@ class Ripper:
         The prefetch pass already warms ``_m3u8_cache`` with wrapper URLs for
         ALAC, so use that when available.
         """
-        # 1) wrapper /m3u8, from the prefetch cache when present.
-        cached = self._m3u8_cache.get(task.adamId)
-        if cached:
-            return cached
+        # 1) wrapper /m3u8, using cached / in-flight coalesced lookup.
         try:
-            wrapper_url = await it(WrapperClient).m3u8(task.adamId)
+            wrapper_url = await self._get_m3u8_cached(task.adamId)
             if wrapper_url:
-                self._m3u8_cache[task.adamId] = wrapper_url
                 return wrapper_url
         except Exception:
             pass
